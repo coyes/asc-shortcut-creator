@@ -23,6 +23,7 @@ sudo apt install gcc libsdl2-dev zenity
 
 - `zenity` handles the file/folder picker dialogs
 - The GUI is [Nuklear](https://github.com/Immediate-Mode-UI/Nuklear) — pure C, single header, no install needed
+- you also need [UMU-Launcher](https://github.com/Open-Wine-Components/umu-launcher) — unified launcher for Windows games on Linux. It is essentially a copy of the Steam Runtime Tools and Steam Linux Runtime that Valve uses for Proton, with some modifications made so that it can be used outside of Steam.
 
 ## Setup
 
