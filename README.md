@@ -6,11 +6,11 @@ Supports Wine/umu games and native Linux apps or AppImages.
 ## Features
 
 - **Wine / umu tab** — create shortcuts for Windows games via `umu-launcher`
-  - Auto-detects installed Proton and GE-Proton versions
-  - Supports WINEPREFIX, locale (LANG/LC_ALL), WoW64, and Wayland flags
+- Auto-detects installed Proton and GE-Proton versions
+- Supports WINEPREFIX, locale (LANG/LC_ALL), WoW64, and Wayland flags
 - **Native / AppImage tab** — create shortcuts for Linux binaries and AppImages
-  - Auto `chmod +x` for AppImages
-  - Full XFCE category list (Games, Accessories, Development, etc.)
+- Auto `chmod +x` for AppImages
+- Full XFCE category list (Games, Accessories, Development, etc.)
 - **Icon support** — accepts PNG, JPG, BMP and any common format, auto-converts and installs to all hicolor sizes (16x16 → 256x256)
 - **Shortcuts button** — opens `~/.local/share/applications/` in your file manager for easy cleanup
 - Uses your system fonts automatically, with CJK (Japanese, Chinese, Korean) support
@@ -18,12 +18,12 @@ Supports Wine/umu games and native Linux apps or AppImages.
 ## Dependencies
 
 ```bash
-sudo apt install gcc libsdl2-dev zenity
+sudo apt install gcc libsdl2-dev libgl-dev yad
 ```
 
-- `zenity` handles the file/folder picker dialogs
-- The GUI is [Nuklear](https://github.com/Immediate-Mode-UI/Nuklear) — pure C, single header, no install needed
-- you also need [UMU-Launcher](https://github.com/Open-Wine-Components/umu-launcher) — unified launcher for Windows games on Linux. It is essentially a copy of the Steam Runtime Tools and Steam Linux Runtime that Valve uses for Proton, with some modifications made so that it can be used outside of Steam.
+- [yad](https://github.com/v1cont/yad) — file/folder picker dialogs (runtime only, not needed to build)
+- [Nuklear](https://github.com/Immediate-Mode-UI/Nuklear) — pure C immediate mode GUI, single header, no install needed
+- [UMU-Launcher](https://github.com/Open-Wine-Components/umu-launcher) — unified launcher for Windows games on Linux via Proton
 
 ## Setup
 
@@ -81,11 +81,12 @@ For Windows games launched via [umu-launcher](https://github.com/Open-Wine-Compo
 | Field | Description |
 |---|---|
 | Game Name | Display name in the start menu |
+| Category | Menu category (Games, Development, Multimedia, etc.) |
 | Game Executable | Path to the `.exe` file |
 | Proton Version | Auto-detected from Steam and compatibilitytools.d, or set a custom path |
+| Locale | Sets `LANG` and `LC_ALL` — useful for Japanese/Chinese/Korean games |
 | Icon | Any image file — auto-converted to all hicolor sizes |
 | WINEPREFIX | Optional — leave empty to use umu's default at `~/.local/share/umu/` |
-| Locale | Sets `LANG` and `LC_ALL` — useful for Japanese/Chinese/Korean games |
 | WoW64 | Adds `PROTON_USE_WINE64=1` |
 | Wayland | Adds `PROTON_ENABLE_WAYLAND=1` |
 
@@ -102,16 +103,16 @@ For Linux-native binaries and AppImages.
 | Field | Description |
 |---|---|
 | App Name | Display name in the start menu |
+| Category | Menu category (Games, Development, Multimedia, etc.) |
 | Binary / AppImage | Path to the executable — `chmod +x` is applied automatically |
 | Icon | Any image file — auto-converted to all hicolor sizes |
-| Category | XFCE menu category (Games, Development, Multimedia, etc.) |
 
 ## What gets created
 
-A `.desktop` file at `~/.local/share/applications/<n>.desktop` and icons at:
+A `.desktop` file at `~/.local/share/applications/<name>.desktop` and icons at:
 
 ```
-~/.local/share/icons/hicolor/{16,32,48,64,128,256}x{16,32,48,64,128,256}/apps/<n>.png
+~/.local/share/icons/hicolor/{16,32,48,64,128,256}x{16,32,48,64,128,256}/apps/<name>.png
 ```
 
 `update-desktop-database` is called automatically — the shortcut appears in your menu immediately.
@@ -131,4 +132,4 @@ Any folder containing a `proton` executable is listed. GE-Proton installed via [
 
 - Tested on Debian 13 + XFCE + X11
 - Should work on any DE that respects the XDG desktop spec
-- Built with pure C11, SDL2, and Nuklear — no GTK, no Qt
+- Built with pure C11, SDL2, yad, and Nuklear

@@ -48,7 +48,7 @@
 /* ─── Constants ─────────────────────────────────────────────── */
 
 #define WINDOW_WIDTH    680
-#define WINDOW_HEIGHT   790
+#define WINDOW_HEIGHT   860
 #define MAX_PATH        1024
 #define MAX_NAME        256
 #define MAX_PROTON      32
@@ -130,6 +130,8 @@ typedef struct {
     char custom_locale[MAX_LOCALE];/* Custom locale string */
     int  wow64;                    /* WoW64 checkbox state */
     int  wayland;                  /* Wayland checkbox state */
+    int  category_index;           /* Category for .desktop (Wine tab) */
+    char custom_category[MAX_NAME];/* Custom category string */
 
     /* Detected Proton versions */
     char proton_list[MAX_PROTON][MAX_PATH];
@@ -144,6 +146,26 @@ typedef struct {
 
 /* ─── Helpers ────────────────────────────────────────────────── */
 
+/* Safe command runner via fork/execv — avoids shell injection from system().
+ * argv must be NULL-terminated. */
+static int run_cmd(const char *path, char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execv(path, argv);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
 static const char *get_home(void) {
     const char *home = getenv("HOME");
     if (!home) {
@@ -155,7 +177,7 @@ static const char *get_home(void) {
 
 /* Create directory and parents (like mkdir -p) */
 static int mkdirp(const char *path) {
-    char tmp[MAX_PATH];
+    char tmp[MAX_PATH * 2];
     snprintf(tmp, sizeof(tmp), "%s", path);
     size_t len = strlen(tmp);
     if (tmp[len - 1] == '/') tmp[len - 1] = '\0';
@@ -268,6 +290,22 @@ static void sanitize_name(const char *in, char *out, size_t outsz) {
     out[j] = '\0';
 }
 
+/* Escape special XDG characters for the Exec string.
+ * Also doubles '%' which has special meaning in .desktop Exec= lines. */
+static void escape_desktop_string(const char *in, char *out, size_t outsz) {
+    size_t j = 0;
+    for (size_t i = 0; in[i] && j < outsz - 2; i++) {
+        char c = in[i];
+        if (c == '"' || c == '\\' || c == '$' || c == '`') {
+            out[j++] = '\\';
+        } else if (c == '%' && j < outsz - 2) {
+            out[j++] = '%'; /* double: %% */
+        }
+        out[j++] = c;
+    }
+    out[j] = '\0';
+}
+
 /* Build the Exec= line */
 static void build_exec(const AppState *s, char *buf, size_t bufsz) {
     const char *proton_path = "";
@@ -289,50 +327,56 @@ static void build_exec(const AppState *s, char *buf, size_t bufsz) {
      * Correct umu-run order:
      * WINEPREFIX=... GAMEID=... STORE=... PROTONPATH=... [extras] umu-run "exe"
      */
-    char buf2[4096] = "env ";
+    char *buf2 = malloc(bufsz);
+    if (!buf2) { buf[0] = '\0'; return; }
+    snprintf(buf2, bufsz, "env ");
 
     /* WINEPREFIX */
     if (strlen(s->wineprefix) > 0) {
         char tmp[MAX_PATH + 20];
         snprintf(tmp, sizeof(tmp), "WINEPREFIX=\"%s\" ", s->wineprefix);
-        strncat(buf2, tmp, sizeof(buf2) - strlen(buf2) - 1);
+        strncat(buf2, tmp, bufsz - strlen(buf2) - 1);
     }
 
     /* GAMEID - always present */
-    strncat(buf2, "GAMEID=ulwgl-0 ", sizeof(buf2) - strlen(buf2) - 1);
+    strncat(buf2, "GAMEID=ulwgl-0 ", bufsz - strlen(buf2) - 1);
 
     /* PROTONPATH - quoted for spaces */
     {
         char tmp[MAX_PATH + 20];
         snprintf(tmp, sizeof(tmp), "PROTONPATH=\"%s\" ", proton_path);
-        strncat(buf2, tmp, sizeof(buf2) - strlen(buf2) - 1);
+        strncat(buf2, tmp, bufsz - strlen(buf2) - 1);
     }
 
     /* WoW64 */
     if (s->wow64) {
-        strncat(buf2, WOW64_FLAG " ", sizeof(buf2) - strlen(buf2) - 1);
+        strncat(buf2, WOW64_FLAG " ", bufsz - strlen(buf2) - 1);
     }
 
     /* Wayland */
     if (s->wayland) {
-        strncat(buf2, WAYLAND_FLAG " ", sizeof(buf2) - strlen(buf2) - 1);
+        strncat(buf2, WAYLAND_FLAG " ", bufsz - strlen(buf2) - 1);
     }
 
     /* Locale */
     if (locale && strlen(locale) > 0) {
         char tmp[256];
         snprintf(tmp, sizeof(tmp), "LANG=%s LC_ALL=%s ", locale, locale);
-        strncat(buf2, tmp, sizeof(buf2) - strlen(buf2) - 1);
+        strncat(buf2, tmp, bufsz - strlen(buf2) - 1);
     }
 
-    /* umu-run "exe" - quoted for spaces */
+    /* umu-run "exe" - quoted and escaped for spaces/special chars */
     {
-        char tmp[MAX_PATH + 12];
-        snprintf(tmp, sizeof(tmp), "umu-run \"%s\"", s->exe_path);
-        strncat(buf2, tmp, sizeof(buf2) - strlen(buf2) - 1);
+        char escaped_exe[MAX_PATH * 2];
+        escape_desktop_string(s->exe_path, escaped_exe, sizeof(escaped_exe));
+        
+        char tmp[MAX_PATH * 2 + 12];
+        snprintf(tmp, sizeof(tmp), "umu-run \"%s\"", escaped_exe);
+        strncat(buf2, tmp, bufsz - strlen(buf2) - 1);
     }
 
     snprintf(buf, bufsz, "%s", buf2);
+    free(buf2);
 }
 
 /* Write the .desktop file and install icon */
@@ -363,13 +407,8 @@ static void create_shortcut(AppState *s) {
 
     /* Install icon if provided */
     int has_icon = (strlen(s->icon_path) > 0);
-    if (has_icon) {
-        if (!install_icon(s->icon_path, safe_name)) {
-            snprintf(s->status_msg, sizeof(s->status_msg),
-                     "Warning: icon install failed, continuing without icon.");
-            has_icon = 0;
-        }
-    }
+    if (has_icon && !install_icon(s->icon_path, safe_name))
+        has_icon = 0;
 
     /* Build Exec line */
     char exec_line[MAX_PATH * 3];
@@ -391,7 +430,14 @@ static void create_shortcut(AppState *s) {
     fprintf(f, "Name=%s\n", s->name);
     fprintf(f, "Exec=%s\n", exec_line);
     fprintf(f, "Type=Application\n");
-    fprintf(f, "Categories=Game;\n");
+    {
+        const char *cat_v = "Game";
+        if (s->category_index > 0 && s->category_index < NUM_CATEGORIES - 1)
+            cat_v = CATEGORIES[s->category_index].value;
+        else if (s->category_index == NUM_CATEGORIES - 1 && strlen(s->custom_category) > 0)
+            cat_v = s->custom_category;
+        fprintf(f, "Categories=%s;\n", cat_v);
+    }
     fprintf(f, "StartupNotify=false\n");
     if (has_icon) fprintf(f, "Icon=%s\n", safe_name);
     fclose(f);
@@ -399,14 +445,14 @@ static void create_shortcut(AppState *s) {
     /* Refresh desktop database */
     char apps_dir[MAX_PATH];
     snprintf(apps_dir, sizeof(apps_dir), "%s/.local/share/applications", home);
-    char cmd[MAX_PATH * 2];
-    snprintf(cmd, sizeof(cmd), "update-desktop-database \"%s\" 2>/dev/null", apps_dir);
-    system(cmd);
+    { char *a[] = { "/usr/bin/update-desktop-database", apps_dir, NULL };
+      run_cmd("/usr/bin/update-desktop-database", a); }
 
-    /* Also refresh icon cache */
-    snprintf(cmd, sizeof(cmd),
-             "gtk-update-icon-cache -f -t \"%s/.local/share/icons/hicolor\" 2>/dev/null", home);
-    system(cmd);
+    /* Refresh icon cache */
+    { char icons_dir[MAX_PATH];
+      snprintf(icons_dir, sizeof(icons_dir), "%s/.local/share/icons/hicolor", home);
+      char *a[] = { "/usr/bin/gtk-update-icon-cache", "-f", "-t", icons_dir, NULL };
+      run_cmd("/usr/bin/gtk-update-icon-cache", a); }
 
     snprintf(s->status_msg, sizeof(s->status_msg),
              "Done! \"%s\" added to Games menu.", s->name);
@@ -414,10 +460,10 @@ static void create_shortcut(AppState *s) {
     s->show_status = 1;
 }
 
-/* ─── Async file picker (runs zenity in background thread) ──── */
+/* ─── Async file picker (runs yad in background thread) ──── */
 
 typedef struct {
-    char cmd[1024];        /* zenity command to run */
+    char cmd[1024];        /* yad command to run */
     char result[MAX_PATH]; /* filled on completion */
     int  done;             /* 0 = running, 1 = done */
     int  ok;               /* 1 = user picked something */
@@ -449,7 +495,7 @@ static void *picker_thread(void *arg) {
     return NULL;
 }
 
-/* Launch zenity asynchronously. Returns 1 if launched, 0 if already busy. */
+/* Launch yad asynchronously. Returns 1 if launched, 0 if already busy. */
 static int launch_picker(const char *cmd) {
     pthread_mutex_lock(&g_picker.mutex);
     if (!g_picker.done) {
@@ -466,8 +512,16 @@ static int launch_picker(const char *cmd) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_create(&tid, &attr, picker_thread, &g_picker);
+    int ret = pthread_create(&tid, &attr, picker_thread, &g_picker);
     pthread_attr_destroy(&attr);
+    
+    if (ret != 0) {
+        /* Failed to spawn thread, release the picker lock */
+        pthread_mutex_lock(&g_picker.mutex);
+        g_picker.done = 1;
+        pthread_mutex_unlock(&g_picker.mutex);
+        return 0;
+    }
     return 1;
 }
 
@@ -501,7 +555,7 @@ static void start_file_pick(PickTarget target, const char *title,
                              const char *filter_name, const char *filter_pattern) {
     char cmd[1024];
     snprintf(cmd, sizeof(cmd),
-             "zenity --file-selection --title=\"%s\" "
+             "yad --file-selection --title=\"%s\" "
              "--file-filter=\"%s | %s\" 2>/dev/null",
              title, filter_name, filter_pattern);
     if (launch_picker(cmd))
@@ -511,7 +565,7 @@ static void start_file_pick(PickTarget target, const char *title,
 static void start_dir_pick(PickTarget target, const char *title) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "zenity --file-selection --directory --title=\"%s\" 2>/dev/null", title);
+             "yad --file-selection --directory --title=\"%s\" 2>/dev/null", title);
     if (launch_picker(cmd))
         g_pick_target = target;
 }
@@ -538,11 +592,8 @@ static void create_native_shortcut(NativeState *n) {
 
     /* Install icon if provided */
     int has_icon = (strlen(n->icon_path) > 0);
-    if (has_icon) {
-        if (!install_icon(n->icon_path, safe_name)) {
-            has_icon = 0;
-        }
-    }
+    if (has_icon && !install_icon(n->icon_path, safe_name))
+        has_icon = 0;
 
     /* Determine category value */
     const char *cat_value = "X-Other";
@@ -566,9 +617,12 @@ static void create_native_shortcut(NativeState *n) {
         n->status_ok = 0; n->show_status = 1; return;
     }
 
+    char escaped_bin[MAX_PATH * 2];
+    escape_desktop_string(n->bin_path, escaped_bin, sizeof(escaped_bin));
+
     fprintf(f, "[Desktop Entry]\n");
     fprintf(f, "Name=%s\n", n->name);
-    fprintf(f, "Exec=\"%s\"\n", n->bin_path);
+    fprintf(f, "Exec=\"%s\"\n", escaped_bin);
     fprintf(f, "Type=Application\n");
     fprintf(f, "Categories=%s;\n", cat_value);
     fprintf(f, "StartupNotify=false\n");
@@ -578,12 +632,12 @@ static void create_native_shortcut(NativeState *n) {
     /* Refresh desktop db and icon cache */
     char apps_dir[MAX_PATH];
     snprintf(apps_dir, sizeof(apps_dir), "%s/.local/share/applications", home);
-    char cmd[MAX_PATH * 2];
-    snprintf(cmd, sizeof(cmd), "update-desktop-database \"%s\" 2>/dev/null", apps_dir);
-    system(cmd);
-    snprintf(cmd, sizeof(cmd),
-             "gtk-update-icon-cache -f -t \"%s/.local/share/icons/hicolor\" 2>/dev/null", home);
-    system(cmd);
+    { char *a[] = { "/usr/bin/update-desktop-database", apps_dir, NULL };
+      run_cmd("/usr/bin/update-desktop-database", a); }
+    { char icons_dir[MAX_PATH];
+      snprintf(icons_dir, sizeof(icons_dir), "%s/.local/share/icons/hicolor", home);
+      char *a[] = { "/usr/bin/gtk-update-icon-cache", "-f", "-t", icons_dir, NULL };
+      run_cmd("/usr/bin/gtk-update-icon-cache", a); }
 
     snprintf(n->status_msg, sizeof(n->status_msg),
              "Done! \"%s\" added to menu.", n->name);
@@ -600,10 +654,12 @@ static void draw_ui(struct nk_context *ctx, AppState *s, NativeState *n,
     int is_custom_locale = (s->locale_index == NUM_LOCALE_PRESETS - 1);
     int is_custom_cat    = (n->category_index == NUM_CATEGORIES - 1);
 
+    int is_custom_wine_cat = (s->category_index == NUM_CATEGORIES - 1);
     int win_h = WINDOW_HEIGHT;
     if (g_active_tab == 0) {
-        if (is_custom_proton) win_h += 40;
-        if (is_custom_locale) win_h += 40;
+        if (is_custom_proton)   win_h += 40;
+        if (is_custom_locale)   win_h += 40;
+        if (is_custom_wine_cat) win_h += 58;
     } else {
         if (is_custom_cat) win_h += 58;
     }
@@ -659,6 +715,24 @@ static void draw_ui(struct nk_context *ctx, AppState *s, NativeState *n,
             nk_layout_row_dynamic(ctx, 10, 1);
 
             nk_layout_row_dynamic(ctx, 18, 1);
+            nk_label_colored(ctx, "Category", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
+            nk_layout_row_dynamic(ctx, 32, 1);
+            s->category_index = nk_combo(ctx, CATEGORY_LABELS, NUM_CATEGORIES,
+                                          s->category_index, 28,
+                                          nk_vec2(WINDOW_WIDTH - 30, 300));
+            if (s->category_index == NUM_CATEGORIES - 1) {
+                nk_layout_row_dynamic(ctx, 10, 1);
+                nk_layout_row_dynamic(ctx, 18, 1);
+                nk_label_colored(ctx, "Custom category name", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
+                nk_layout_row_dynamic(ctx, 32, 1);
+                USE_MONO;
+                nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, s->custom_category,
+                                                sizeof(s->custom_category), nk_filter_default);
+                USE_UI;
+            }
+            nk_layout_row_dynamic(ctx, 10, 1);
+
+            nk_layout_row_dynamic(ctx, 18, 1);
             nk_label_colored(ctx, "Game Executable (.exe)", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
             nk_layout_row_begin(ctx, NK_STATIC, 32, 2);
             nk_layout_row_push(ctx, WINDOW_WIDTH - 156);
@@ -701,6 +775,21 @@ static void draw_ui(struct nk_context *ctx, AppState *s, NativeState *n,
             nk_layout_row_dynamic(ctx, 10, 1);
 
             nk_layout_row_dynamic(ctx, 18, 1);
+            nk_label_colored(ctx, "Locale (LANG / LC_ALL)", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
+            nk_layout_row_dynamic(ctx, 32, 1);
+            s->locale_index = nk_combo(ctx, LOCALE_PRESETS, NUM_LOCALE_PRESETS,
+                                        s->locale_index, 28,
+                                        nk_vec2(WINDOW_WIDTH - 30, 200));
+            if (is_custom_locale) {
+                nk_layout_row_dynamic(ctx, 32, 1);
+                USE_MONO;
+                nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, s->custom_locale,
+                                                sizeof(s->custom_locale), nk_filter_default);
+                USE_UI;
+            }
+            nk_layout_row_dynamic(ctx, 10, 1);
+
+            nk_layout_row_dynamic(ctx, 18, 1);
             nk_label_colored(ctx, "Icon (PNG recommended)", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
             nk_layout_row_begin(ctx, NK_STATIC, 32, 2);
             nk_layout_row_push(ctx, WINDOW_WIDTH - 156);
@@ -727,21 +816,6 @@ static void draw_ui(struct nk_context *ctx, AppState *s, NativeState *n,
             if (nk_button_label(ctx, "Browse..."))
                 start_dir_pick(PICK_WINEPREFIX, "Select WINEPREFIX Directory");
             nk_layout_row_end(ctx);
-            nk_layout_row_dynamic(ctx, 10, 1);
-
-            nk_layout_row_dynamic(ctx, 18, 1);
-            nk_label_colored(ctx, "Locale (LANG / LC_ALL)", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
-            nk_layout_row_dynamic(ctx, 32, 1);
-            s->locale_index = nk_combo(ctx, LOCALE_PRESETS, NUM_LOCALE_PRESETS,
-                                        s->locale_index, 28,
-                                        nk_vec2(WINDOW_WIDTH - 30, 200));
-            if (is_custom_locale) {
-                nk_layout_row_dynamic(ctx, 32, 1);
-                USE_MONO;
-                nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, s->custom_locale,
-                                                sizeof(s->custom_locale), nk_filter_default);
-                USE_UI;
-            }
             nk_layout_row_dynamic(ctx, 10, 1);
 
             nk_layout_row_dynamic(ctx, 28, 1);
@@ -787,6 +861,24 @@ static void draw_ui(struct nk_context *ctx, AppState *s, NativeState *n,
                                             sizeof(n->name), nk_filter_default);
             USE_UI;
             nk_layout_row_dynamic(ctx, 10, 1);
+            nk_layout_row_dynamic(ctx, 18, 1);
+            nk_label_colored(ctx, "Category", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
+            nk_layout_row_dynamic(ctx, 32, 1);
+            n->category_index = nk_combo(ctx, CATEGORY_LABELS, NUM_CATEGORIES,
+                                          n->category_index, 28,
+                                          nk_vec2(WINDOW_WIDTH - 30, 300));
+            if (is_custom_cat) {
+                nk_layout_row_dynamic(ctx, 10, 1);
+                nk_layout_row_dynamic(ctx, 18, 1);
+                nk_label_colored(ctx, "Custom category name", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
+                nk_layout_row_dynamic(ctx, 32, 1);
+                USE_MONO;
+                nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, n->custom_category,
+                                                sizeof(n->custom_category), nk_filter_default);
+                USE_UI;
+            }
+            nk_layout_row_dynamic(ctx, 10, 1);
+
 
             nk_layout_row_dynamic(ctx, 18, 1);
             nk_label_colored(ctx, "Binary / AppImage", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
@@ -818,22 +910,6 @@ static void draw_ui(struct nk_context *ctx, AppState *s, NativeState *n,
             nk_layout_row_end(ctx);
             nk_layout_row_dynamic(ctx, 10, 1);
 
-            nk_layout_row_dynamic(ctx, 18, 1);
-            nk_label_colored(ctx, "Category", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
-            nk_layout_row_dynamic(ctx, 32, 1);
-            n->category_index = nk_combo(ctx, CATEGORY_LABELS, NUM_CATEGORIES,
-                                          n->category_index, 28,
-                                          nk_vec2(WINDOW_WIDTH - 30, 300));
-            if (is_custom_cat) {
-                nk_layout_row_dynamic(ctx, 10, 1);
-                nk_layout_row_dynamic(ctx, 18, 1);
-                nk_label_colored(ctx, "Custom category name", NK_TEXT_LEFT, nk_rgb(0x9a, 0x8c, 0x80));
-                nk_layout_row_dynamic(ctx, 32, 1);
-                USE_MONO;
-                nk_edit_string_zero_terminated(ctx, NK_EDIT_FIELD, n->custom_category,
-                                                sizeof(n->custom_category), nk_filter_default);
-                USE_UI;
-            }
             nk_layout_row_dynamic(ctx, 14, 1);
             nk_layout_row_dynamic(ctx, 1, 1);
             nk_rule_horizontal(ctx, ctx->style.window.border_color, nk_false);
@@ -906,7 +982,7 @@ int main(void) {
         "asc - A Shortcut Creator",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         WINDOW_WIDTH, WINDOW_HEIGHT,
-        SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+        SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
 
     if (!win) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -1100,7 +1176,7 @@ int main(void) {
      * bg:        #1c1a1a   primary background
      * bg2:       #262220   cards / secondary blocks
      * text:      #ede0d0   primary text (soft cream)
-     * text2:     #9a8c80   secondary text / labels
+     * nk_rgb(0x9a, 0x8c, 0x80):     #9a8c80   secondary text / labels
      * accent:    #c8a978   links, highlights, hover
      * accent2:   #a08858   pressed / active accent
      * border:    #3a3430   subtle borders
@@ -1108,7 +1184,6 @@ int main(void) {
     struct nk_color bg      = nk_rgb(0x1c, 0x1a, 0x1a);
     struct nk_color bg2     = nk_rgb(0x26, 0x22, 0x20);
     struct nk_color text1   = nk_rgb(0xed, 0xe0, 0xd0);
-    struct nk_color text2   = nk_rgb(0x9a, 0x8c, 0x80);
     struct nk_color accent  = nk_rgb(0xc8, 0xa9, 0x78);
     struct nk_color accent2 = nk_rgb(0xa0, 0x88, 0x58);
     struct nk_color border  = nk_rgb(0x3a, 0x34, 0x30);
@@ -1195,8 +1270,6 @@ int main(void) {
     ctx->style.scrollv.cursor_active = nk_style_item_color(accent);
     ctx->style.scrollv.border_color  = border;
 
-    /* Suppress unused variable warnings */
-    (void)text2;
 
 
     /* Main loop */
@@ -1204,11 +1277,13 @@ int main(void) {
     while (running) {
         SDL_Event evt;
         nk_input_begin(ctx);
-        while (SDL_PollEvent(&evt)) {
-            if (evt.type == SDL_QUIT) running = 0;
-            if (evt.type == SDL_WINDOWEVENT &&
-                evt.window.event == SDL_WINDOWEVENT_CLOSE) running = 0;
-            nk_sdl_handle_event(&evt);
+        if (SDL_WaitEventTimeout(&evt, 32)) {
+            do {
+                if (evt.type == SDL_QUIT) running = 0;
+                if (evt.type == SDL_WINDOWEVENT &&
+                    evt.window.event == SDL_WINDOWEVENT_CLOSE) running = 0;
+                nk_sdl_handle_event(&evt);
+            } while (SDL_PollEvent(&evt));
         }
         nk_input_end(ctx);
 
